@@ -31,18 +31,64 @@ class Lock {
 			return true;
 		}
 
-		// Default limit for concurrent events.
-		if ( ! is_numeric( $limit ) ) {
+		// Default limit for concurrent events
+		if ( ! is_int( $limit ) ) {
 			$limit = LOCK_DEFAULT_LIMIT;
 		}
 
-		// Check if process can run.
-		if ( self::get_lock_value( $lock ) >= $limit ) {
+		// Check lock according to limit
+		if ( 1 === $limit ) {
+			return self::check_single_lock( $lock, self::get_lock_value( $lock ) );
+		} else {
+			return self::check_multi_lock( $lock, self::get_lock_value( $lock ), $limit, $timeout );
+		}
+	}
+
+	/**
+	 * Check a single-concurrency lock
+	 *
+	 * @param string $lock
+	 * @param int    $lock_value
+	 * @return bool
+	 */
+	private static function check_single_lock( $lock, $lock_value ) {
+		if ( $lock_value >= 1 ) {
 			return false;
 		} else {
 			wp_cache_incr( self::get_key( $lock ) );
 			return true;
 		}
+	}
+
+	/**
+	 * Check a multiple-concurrency lock
+	 *
+	 * @param string $lock
+	 * @param mixed  $lock_value
+	 * @param int    $limit
+	 * @param int    $timeout
+	 * @return bool
+	 */
+	private static function check_multi_lock( $lock, $lock_value, $limit, $timeout ) {
+		// Upgrade to timestamped multi-lock, otherwise clear deadlocks
+		if ( is_int( $lock_value ) ) {
+			$lock_value = array_fill( 0, $lock_value, time() );
+		} elseif ( is_array( $lock_value ) ) {
+			$lock_value = empty( $lock_value ) ? array() : self::purge_stale_values( $lock_value, $timeout );
+		} else {
+			$lock_value = array();
+		}
+
+		// Still locked
+		if ( count( $lock_value ) >= $limit ) {
+			return false;
+		}
+
+		// Available, claim a slot
+		$lock_value[] = time();
+		wp_cache_set( self::get_key( $lock ), $lock_value );
+
+		return true;
 	}
 
 	/**
@@ -53,15 +99,51 @@ class Lock {
 	 * @return bool
 	 */
 	public static function free_lock( $lock, $expires = 0 ) {
-		if ( self::get_lock_value( $lock ) > 1 ) {
+		$lock_value = self::get_lock_value( $lock );
+
+		if ( empty( $lock_value ) ) {
+			wp_cache_set( self::get_key( $lock, 'timestamp' ), time(), null, $expires );
+			return true;
+		}
+
+		if ( is_int( $lock_value ) ) {
+			self::free_single_lock( $lock, $lock_value, $expires );
+		} else {
+			self::free_multi_lock( $lock, $lock_value, $expires );
+		}
+
+		return true;
+	}
+
+	/**
+	 * Free a single-concurrency lock
+	 *
+	 * @param string $lock
+	 * @param mixed  $lock_value
+	 * @param int    $expires
+	 */
+	private static function free_single_lock( $lock, $lock_value, $expires ) {
+		if ( $lock_value > 1 ) {
 			wp_cache_decr( self::get_key( $lock ) );
 		} else {
 			wp_cache_set( self::get_key( $lock ), 0, null, $expires );
 		}
 
 		wp_cache_set( self::get_key( $lock, 'timestamp' ), time(), null, $expires );
+	}
 
-		return true;
+	/**
+	 * Free old multi-concurrency lock
+	 *
+	 * @param string $lock
+	 * @param mixed  $lock_value
+	 * @param int    $expires
+	 */
+	private static function free_multi_lock( $lock, $lock_value, $expires ) {
+		sort( $lock_value, SORT_NUMERIC );
+		array_shift( $lock_value );
+		wp_cache_set( self::get_key( $lock ), $lock_value, null, $expires );
+		wp_cache_set( self::get_key( $lock, 'timestamp' ), time(), null, $expires );
 	}
 
 	/**
@@ -106,7 +188,18 @@ class Lock {
 	 * @return int
 	 */
 	public static function get_lock_value( $lock ) {
-		return (int) wp_cache_get( self::get_key( $lock ), null, true );
+		$value = wp_cache_get( self::get_key( $lock ), null, true );
+
+		if ( ! is_numeric( $value ) && ! is_array( $value ) ) {
+			self::reset_lock( $lock );
+			return 0;
+		}
+
+		if ( is_numeric( $value ) ) {
+			$value = (int) $value;
+		}
+
+		return $value;
 	}
 
 	/**
@@ -131,5 +224,18 @@ class Lock {
 		wp_cache_set( self::get_key( $lock, 'timestamp' ), time(), null, $expires );
 
 		return true;
+	}
+
+	/**
+	 * Remove stale lock entries
+	 *
+	 * @param array $locks
+	 * @param int   $timeout
+	 * @return array
+	 */
+	private static function purge_stale_values( $locks, $timeout ) {
+		return array_filter( $locks, function( $lock ) use( $timeout ) {
+			return $lock > time() - $timeout;
+		} );
 	}
 }
