@@ -882,6 +882,43 @@ class Events_Store extends Singleton {
 
 		return (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(ID) FROM {$this->get_table_name()} WHERE status = %s", $status ) ); // Cannot prepare table name. @codingStandardsIgnoreLine
 	}
+
+	/**
+	 * Remove entries by schedule
+	 *
+	 * @param string|null $schedule The schedule to remove events for
+	 */
+	public function delete_events_by_schedule( $schedule ) {
+		global $wpdb;
+
+		$result = $wpdb->delete(
+			$this->get_table_name(), array(
+				'schedule' => $schedule,
+			)
+		);
+
+		$this->flush_internal_caches();
+
+		return $result;
+	}
+
+	/**
+	 * Count number of events with a given schedule
+	 *
+	 * @param string|null $schedule Event schedule to count.
+	 * @return int|false
+	 */
+	public function count_events_by_schedule( $schedule ) {
+		global $wpdb;
+
+		$sql = '';
+
+		if ( is_null( $schedule ) ) {
+			return (int) $wpdb->get_var( "SELECT COUNT(ID) FROM {$this->get_table_name()} WHERE schedule IS NULL" ); // Cannot prepare table name. @codingStandardsIgnoreLine
+		} else {
+			return (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(ID) FROM {$this->get_table_name()} WHERE schedule = %s", $schedule ) ); // Cannot prepare table name. @codingStandardsIgnoreLine
+		}
+	}
 }
 
 Events_Store::instance();
