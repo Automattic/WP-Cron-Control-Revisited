@@ -49,6 +49,9 @@ class Events extends Singleton {
 
 		// Allow code loaded as late as the theme to modify the whitelist.
 		add_action( 'after_setup_theme', array( $this, 'populate_concurrent_action_whitelist' ) );
+
+		// Though blocked, ensure Core's cron execution respects plugin's curation.
+		add_filter( 'pre_get_ready_cron_jobs', [ $this, 'filter_pending_event_list' ] );
 	}
 
 	/**
@@ -86,6 +89,42 @@ class Events extends Singleton {
 		if ( is_array( $concurrency_whitelist ) && ! empty( $concurrency_whitelist ) ) {
 			$this->concurrent_action_whitelist = $concurrency_whitelist;
 		}
+	}
+
+	/**
+	 * Pass curated event list to Core requests.
+	 *
+	 * @param array|null $events Current event list.
+	 * @return array|null
+	 */
+	public function filter_pending_event_list( $events ) {
+		if ( null !== $events ) {
+			return $events;
+		}
+
+		$events = $this->get_events();
+
+		if ( empty( $events['events'] ) ) {
+			return [];
+		}
+
+		$formatted_events = [];
+
+		foreach ( $events['events'] as $event ) {
+			$event['action_hashed'] = $event['action'];
+			unset( $event['action'] );
+
+			$event_data = get_event_by_attributes( $event );
+
+			if ( ! $event_data ) {
+				continue;
+			}
+
+			$event_data->args   = maybe_unserialize( $event_data->args );
+			$formatted_events[] = $event_data;
+		}
+
+		return inflate_collapsed_events_array( $formatted_events );
 	}
 
 	/**

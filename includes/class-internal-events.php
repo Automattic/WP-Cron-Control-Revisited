@@ -272,7 +272,7 @@ class Internal_Events extends Singleton {
 				array(
 					'timestamp' => $timestamp,
 					'action'    => $internal_event['action'],
-					'instance'  => md5( maybe_serialize( array() ) ),
+					'instance'  => Events_Store::instance()->generate_instance_identifier( array() ),
 				)
 			);
 

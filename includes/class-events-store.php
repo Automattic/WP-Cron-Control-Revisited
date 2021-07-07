@@ -62,7 +62,7 @@ class Events_Store extends Singleton {
 
 		// Enable plugin when conditions support it, otherwise limit errors as much as possible.
 		if ( self::is_installed() ) {
-			// Option interception.
+			// Ensure that any direct manipulation of the cron option is captured.
 			add_filter( 'pre_option_cron', array( $this, 'get_option' ) );
 			add_filter( 'pre_update_option_cron', array( $this, 'update_option' ), 10, 2 );
 
@@ -258,7 +258,6 @@ class Events_Store extends Singleton {
 	 * Override cron option requests with data from custom table
 	 */
 	public function get_option() {
-
 		// If this thread has already generated the cron array,
 		// use the copy from local memory. Don't fetch this list
 		// remotely multiple times per request (even from the
@@ -385,7 +384,7 @@ class Events_Store extends Singleton {
 			return $job;
 		}
 
-		$instance = md5( maybe_serialize( $job->args ) );
+		$instance = $this->generate_instance_identifier( $job->args );
 		if ( 0 !== $this->get_job_id( $job->timestamp, $job->hook, $instance ) ) {
 			return false;
 		}
@@ -434,6 +433,62 @@ class Events_Store extends Singleton {
 		}
 
 		return $jobs;
+	}
+
+	/**
+	 * Retrieve a list of IDs for a given hook, optionally filtering by arguments.
+	 *
+	 * For use in situations where timestamp is unknown, as all other methods require the timestamp.
+	 *
+	 * @param array      $query_args Lookup arguments.
+	 * @param string     $hook Job action.
+	 * @param array|null $job_args Job arguments to search by.
+	 * @return array
+	 */
+	public function get_job_ids_by_hook( $query_args, $hook, $job_args ) {
+		global $wpdb;
+
+		if ( ! isset( $query_args['status'] ) ) {
+			$query_args['status'] = self::STATUS_PENDING;
+		}
+
+		if ( ! isset( $query_args['quantity'] ) || ! is_numeric( $query_args['quantity'] ) ) {
+			$query_args['quantity'] = 100;
+		}
+
+		if ( isset( $query_args['page'] ) ) {
+			$page   = max( 0, $query_args['page'] - 1 );
+			$offset = $page * $query_args['quantity'];
+		} else {
+			$offset = 0;
+		}
+
+		if ( is_array( $job_args ) ) {
+			$query = $wpdb->prepare(
+				"SELECT ID FROM {$this->get_table_name()} WHERE action = %s AND instance = %s AND status = %s LIMIT %d,%d;", // Cannot prepare table name. @codingStandardsIgnoreLine
+				$hook,
+				$this->generate_instance_identifier( $job_args ),
+				$query_args['status'],
+				$offset,
+				$query_args['quantity']
+			);
+		} else {
+			$query = $wpdb->prepare(
+				"SELECT ID FROM {$this->get_table_name()} WHERE action = %s AND status = %s LIMIT %d,%d;", // Cannot prepare table name. @codingStandardsIgnoreLine
+				$hook,
+				$query_args['status'],
+				$offset,
+				$query_args['quantity']
+			);
+		}
+
+		$jobs = $wpdb->get_col( $query ); // Already prepared. @codingStandardsIgnoreLine
+
+		if ( is_array( $jobs ) ) {
+			return array_map( 'absint', $jobs );
+		} else {
+			return [];
+		}
 	}
 
 	/**
@@ -520,6 +575,89 @@ class Events_Store extends Singleton {
 	}
 
 	/**
+	 * Retrieve a hook's next-scheduled occurrence.
+	 *
+	 * @param string $hook Job hook.
+	 * @param array  $args Job arguments.
+	 * @return object|null
+	 */
+	public function get_hook_next_scheduled( $hook, $args ) {
+		global $wpdb;
+
+		$instance = $this->generate_instance_identifier( $args );
+		if ( false !== $job = $this->get_cached_job( $hook, $instance ) ) {
+			return $job;
+		}
+
+		$job = $wpdb->get_row(
+			$wpdb->prepare(
+				"SELECT * FROM {$this->get_table_name()} WHERE action = %s AND instance = %s AND status = %s ORDER BY timestamp ASC LIMIT 1", // Cannot prepare table name. @codingStandardsIgnoreLine
+				$hook,
+				$instance,
+				self::STATUS_PENDING
+			)
+		);
+
+		if ( is_object( $job ) && ! is_wp_error( $job ) ) {
+			$job = $this->format_job( $job );
+		} else {
+			$job = null;
+		}
+
+		$this->cache_job( $hook, $instance, $job );
+
+		return $job;
+	}
+
+	public function get_cached_job( $action, $instance ) {
+		$cache = wp_cache_get( 'cron_control_jobs' );
+		if ( ! $cache ) {
+			return false;
+		}
+
+		$key = md5( $action . $instance );
+		$cache = unserialize( $cache );
+		if ( ! isset( $cache[ $key ] ) || ! $cache[ $key ] ) {
+			return false;
+		}
+
+		return $cache[ $key ];
+	}
+
+	public function cache_job( $action, $instance, $job ) {
+		if ( ! $action || ! $instance || ! $job ) {
+			return false;
+		}
+
+		// Bypass local cache to prevent re-saving stale data
+		$cache = wp_cache_get( 'cron_control_jobs', null, true );
+		$cache = unserialize( $cache );
+		if ( ! $cache ) {
+			$cache = [];
+		}
+
+		$key = md5( $action . $instance );
+		$cache[ $key ] = $job;
+
+		return wp_cache_set( 'cron_control_jobs', serialize( $cache ) );
+	}
+
+	public function clear_cached_job( $action, $instance ) {
+		// Bypass local cache to prevent re-saving stale data
+		$cache = wp_cache_get( 'cron_control_jobs', null, true );
+		if ( ! $cache ) {
+			return false;
+		}
+
+		$key = md5( $action . $instance );
+		$cache = unserialize( $cache );
+
+		unset( $cache[ $key ] );
+
+		return wp_cache_set( 'cron_control_jobs', serialize( $cache ) );
+	}
+
+	/**
 	 * Get ID for given event details
 	 *
 	 * Used in situations where performance matters, which is why it exists despite duplicating `get_job_by_attributes()`
@@ -578,11 +716,14 @@ class Events_Store extends Singleton {
 
 		global $wpdb;
 
+		$instance = $this->generate_instance_identifier( $args['args'] );
+		$this->clear_cached_job( $action, $instance );
+
 		$job_post = array(
 			'timestamp'     => $timestamp,
 			'action'        => $action,
 			'action_hashed' => md5( $action ),
-			'instance'      => md5( maybe_serialize( $args['args'] ) ),
+			'instance'      => $instance,
 			'args'          => maybe_serialize( $args['args'] ),
 			'last_modified' => current_time( 'mysql', true ),
 		);
@@ -635,6 +776,7 @@ class Events_Store extends Singleton {
 			return false;
 		}
 
+		$this->clear_cached_job( $action, $instance );
 		return $this->mark_job_record_completed( $job_id, $flush_cache );
 	}
 
@@ -728,7 +870,7 @@ class Events_Store extends Singleton {
 			return false;
 		}
 
-		$option_flat = array();
+		$option_flat = array( array() );
 
 		// Restore option from cached pieces.
 		for ( $i = 1; $i <= $cache_details['buckets']; $i++ ) {
@@ -740,8 +882,10 @@ class Events_Store extends Singleton {
 				return false;
 			}
 
-			$option_flat += $cached_slice;
+			$option_flat[] = $cached_slice;
 		}
+
+		$option_flat = array_merge( ...$option_flat );
 
 		// Something's missing, likely due to cache eviction.
 		if ( empty( $option_flat ) || count( $option_flat ) !== $cache_details['event_count'] ) {
@@ -815,6 +959,16 @@ class Events_Store extends Singleton {
 	public function flush_internal_caches() {
 		$this->is_option_cache_valid = false;
 		return wp_cache_delete( self::CACHE_KEY );
+	}
+
+	/**
+	 * Generate the same instance identifier Core uses to key array.
+	 *
+	 * @param array $args Event arguments.
+	 * @return string
+	 */
+	public function generate_instance_identifier( $args ) {
+		return md5( serialize( $args ) );
 	}
 
 	/**
