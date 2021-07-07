@@ -511,7 +511,9 @@ func runWpCliCmd(subcommand []string) (string, error) {
 			logger.Printf("%s - %s", err, wpOutStr)
 			logger.Println(fmt.Sprintf("%+v", subcommand))
 		}
-
+		if strings.Contains(wpOutStr, "Error: No resources available to run the job with action `msm_cron_generate_sitemap_for_year_month_day`") {
+			return wpOutStr, nil
+		}
 		return wpOutStr, err
 	}
 
